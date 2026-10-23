@@ -158,8 +158,7 @@ class _DefaultPipelineProcessor:
     _intent_agent_only: bool = field(init=False, default=False)
     _streamed_response_text: bool = field(init=False, default=False)
     _invalidated: bool = field(init=False, default=False)
-    _stt_last_timestamp_ms: int = field(init=False, default=0)
-    _stt_vad_end_sent: bool = field(init=False, default=False)
+    _stt_last_timestamp_ms: int | None = field(init=False, default=None)
     intent_agent: conversation.AgentInfo | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
@@ -419,13 +418,19 @@ class _DefaultPipelineProcessor:
         else:
             engine = self.stt_provider.entity_id
 
+        audio_processing = self.stt_provider.async_get_audio_processing(metadata)
+        provider_vad = (
+            self.host.audio_settings.is_vad_enabled
+            and not audio_processing.requires_external_vad
+        )
+
         self.host.process_event(
             PipelineEvent(
                 PipelineEventType.STT_START,
                 {
                     "engine": engine,
                     "metadata": asdict(metadata),
-                    "audio_processing": asdict(self.stt_provider.audio_processing),
+                    "audio_processing": asdict(audio_processing),
                 },
             )
         )
@@ -437,7 +442,7 @@ class _DefaultPipelineProcessor:
             stt_vad: VoiceCommandSegmenter | None = None
             if (
                 self.host.audio_settings.is_vad_enabled
-                and self.stt_provider.audio_processing.requires_external_vad
+                and audio_processing.requires_external_vad
             ):
                 stt_vad = VoiceCommandSegmenter(
                     silence_seconds=self.host.audio_settings.silence_seconds
@@ -450,7 +455,9 @@ class _DefaultPipelineProcessor:
             )
             result = await process_audio_stream(
                 metadata,
-                self._speech_to_text_stream(audio_stream=stream, stt_vad=stt_vad),
+                self._speech_to_text_stream(
+                    audio_stream=stream, stt_vad=stt_vad, provider_vad=provider_vad
+                ),
             )
         except asyncio.CancelledError, TimeoutError:
             raise  # expected
@@ -468,16 +475,14 @@ class _DefaultPipelineProcessor:
 
         _LOGGER.debug("speech-to-text result %s", result)
 
-        # Satellites only stop recording on STT_VAD_END, which the segmenter never
-        # sends if the provider ends the stream first or does its own endpointing
-        if self.host.audio_settings.is_vad_enabled and not self._stt_vad_end_sent:
+        # The provider detected the end of speech by returning a result
+        if provider_vad and self._stt_last_timestamp_ms is not None:
             self.host.process_event(
                 PipelineEvent(
                     PipelineEventType.STT_VAD_END,
                     {"timestamp": self._stt_last_timestamp_ms},
                 )
             )
-            self._stt_vad_end_sent = True
 
         if result.result != stt.SpeechResultState.SUCCESS:
             raise SpeechToTextError(
@@ -507,6 +512,7 @@ class _DefaultPipelineProcessor:
         self,
         audio_stream: AsyncIterable[EnhancedAudioChunk],
         stt_vad: VoiceCommandSegmenter | None,
+        provider_vad: bool,
         sample_rate: int = SAMPLE_RATE,
         sample_width: int = SAMPLE_WIDTH,
     ) -> AsyncGenerator[bytes]:
@@ -514,7 +520,6 @@ class _DefaultPipelineProcessor:
         sent_vad_start = False
         async for chunk in audio_stream:
             self.host.capture_audio(chunk.audio)
-            self._stt_last_timestamp_ms = chunk.timestamp_ms
 
             if stt_vad is not None:
                 chunk_seconds = (len(chunk.audio) // sample_width) / sample_rate
@@ -526,23 +531,29 @@ class _DefaultPipelineProcessor:
                             {"timestamp": chunk.timestamp_ms},
                         )
                     )
-                    self._stt_vad_end_sent = True
                     break
 
-                speech_started = stt_vad.in_command
-            else:
-                # No segmenter means either VAD is disabled or the provider does
-                # its own endpointing; only the latter needs VAD events
-                speech_started = self.host.audio_settings.is_vad_enabled
-
-            if speech_started and not sent_vad_start:
-                self.host.process_event(
-                    PipelineEvent(
-                        PipelineEventType.STT_VAD_START,
-                        {"timestamp": chunk.timestamp_ms},
+                if stt_vad.in_command and (not sent_vad_start):
+                    # Speech detected at start of voice command
+                    self.host.process_event(
+                        PipelineEvent(
+                            PipelineEventType.STT_VAD_START,
+                            {"timestamp": chunk.timestamp_ms},
+                        )
                     )
-                )
-                sent_vad_start = True
+                    sent_vad_start = True
+            else:
+                if provider_vad and not sent_vad_start:
+                    # The provider detects the end of speech, so the command starts here
+                    self.host.process_event(
+                        PipelineEvent(
+                            PipelineEventType.STT_VAD_START,
+                            {"timestamp": chunk.timestamp_ms},
+                        )
+                    )
+                    sent_vad_start = True
+
+                self._stt_last_timestamp_ms = chunk.timestamp_ms
 
             yield chunk.audio
 
